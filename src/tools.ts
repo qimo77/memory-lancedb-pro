@@ -5,6 +5,9 @@
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
@@ -15,6 +18,8 @@ import {
   parseSmartMetadata,
   stringifySmartMetadata,
 } from "./smart-metadata.js";
+import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./self-improvement-files.js";
+import { getDisplayCategoryTag } from "./reflection-metadata.js";
 
 // ============================================================================
 // Types
@@ -25,6 +30,7 @@ export const MEMORY_CATEGORIES = [
   "fact",
   "decision",
   "entity",
+  "reflection",
   "other",
 ] as const;
 
@@ -34,6 +40,10 @@ function stringEnum<T extends readonly [string, ...string[]]>(values: T) {
     enum: [...values],
   });
 }
+export type MdMirrorWriter = (
+  entry: { text: string; category: string; scope: string; timestamp?: number },
+  meta?: { source?: string; agentId?: string },
+) => Promise<void>;
 
 interface ToolContext {
   retriever: MemoryRetriever;
@@ -41,6 +51,8 @@ interface ToolContext {
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
   agentId?: string;
+  workspaceDir?: string;
+  mdMirror?: MdMirrorWriter | null;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -67,7 +79,8 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
-    category: r.entry.category,
+    category: getDisplayCategoryTag(r.entry),
+    rawCategory: r.entry.category,
     scope: r.entry.scope,
     importance: r.entry.importance,
     score: r.score,
@@ -121,6 +134,253 @@ async function retrieveWithRetry(
     results = await retriever.retrieve(params);
   }
   return results;
+}
+
+function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
+  const runtime = toolCtx as Record<string, unknown> | undefined;
+  const runtimePath = typeof runtime?.workspaceDir === "string" ? runtime.workspaceDir.trim() : "";
+  if (runtimePath) return runtimePath;
+  if (fallback && fallback.trim()) return fallback;
+  return join(homedir(), ".openclaw", "workspace");
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_log",
+      label: "Self-Improvement Log",
+      description: "Log structured learning/error entries into .learnings for governance and later distillation.",
+      parameters: Type.Object({
+        type: stringEnum(["learning", "error"]),
+        summary: Type.String({ description: "One-line summary" }),
+        details: Type.Optional(Type.String({ description: "Detailed context or error output" })),
+        suggestedAction: Type.Optional(Type.String({ description: "Concrete action to prevent recurrence" })),
+        category: Type.Optional(Type.String({ description: "learning category (correction/best_practice/knowledge_gap) when type=learning" })),
+        area: Type.Optional(Type.String({ description: "frontend|backend|infra|tests|docs|config or custom area" })),
+        priority: Type.Optional(Type.String({ description: "low|medium|high|critical" })),
+      }),
+      async execute(_toolCallId, params) {
+        const {
+          type,
+          summary,
+          details = "",
+          suggestedAction = "",
+          category = "best_practice",
+          area = "config",
+          priority = "medium",
+        } = params as {
+          type: "learning" | "error";
+          summary: string;
+          details?: string;
+          suggestedAction?: string;
+          category?: string;
+          area?: string;
+          priority?: string;
+        };
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          const { id: entryId, filePath } = await appendSelfImprovementEntry({
+            baseDir: workspaceDir,
+            type,
+            summary,
+            details,
+            suggestedAction,
+            category,
+            area,
+            priority,
+            source: "memory-lancedb-pro/self_improvement_log",
+          });
+          const fileName = type === "learning" ? "LEARNINGS.md" : "ERRORS.md";
+
+          return {
+            content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
+            details: { action: "logged", type, id: entryId, filePath },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to log self-improvement entry: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_log_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_log" }
+  );
+}
+
+export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_extract_skill",
+      label: "Extract Skill From Learning",
+      description: "Create a new skill scaffold from a learning entry and mark the source learning as promoted_to_skill.",
+      parameters: Type.Object({
+        learningId: Type.String({ description: "Learning ID like LRN-YYYYMMDD-001" }),
+        skillName: Type.String({ description: "Skill folder name, lowercase with hyphens" }),
+        sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md"])),
+        outputDir: Type.Optional(Type.String({ description: "Relative output dir under workspace (default: skills)" })),
+      }),
+      async execute(_toolCallId, params) {
+        const { learningId, skillName, sourceFile = "LEARNINGS.md", outputDir = "skills" } = params as {
+          learningId: string;
+          skillName: string;
+          sourceFile?: "LEARNINGS.md" | "ERRORS.md";
+          outputDir?: string;
+        };
+        try {
+          if (!/^(LRN|ERR)-\d{8}-\d{3}$/.test(learningId)) {
+            return {
+              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-..." }],
+              details: { error: "invalid_learning_id" },
+            };
+          }
+          if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName)) {
+            return {
+              content: [{ type: "text", text: "Invalid skillName. Use lowercase letters, numbers, and hyphens only." }],
+              details: { error: "invalid_skill_name" },
+            };
+          }
+
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureSelfImprovementLearningFiles(workspaceDir);
+          const learningsPath = join(workspaceDir, ".learnings", sourceFile);
+          const learningBody = await readFile(learningsPath, "utf-8");
+          const escapedLearningId = escapeRegExp(learningId.trim());
+          const entryRegex = new RegExp(`## \\[${escapedLearningId}\\][\\s\\S]*?(?=\\n## \\[|$)`, "m");
+          const match = learningBody.match(entryRegex);
+          if (!match) {
+            return {
+              content: [{ type: "text", text: `Learning entry ${learningId} not found in .learnings/${sourceFile}` }],
+              details: { error: "learning_not_found", learningId, sourceFile },
+            };
+          }
+
+          const summaryMatch = match[0].match(/### Summary\n([\s\S]*?)\n###/m);
+          const summary = (summaryMatch?.[1] ?? "Summarize the source learning here.").trim();
+          const safeOutputDir = outputDir
+            .replace(/\\/g, "/")
+            .split("/")
+            .filter((segment) => segment && segment !== "." && segment !== "..")
+            .join("/");
+          const skillDir = join(workspaceDir, safeOutputDir || "skills", skillName);
+          await mkdir(skillDir, { recursive: true });
+          const skillPath = join(skillDir, "SKILL.md");
+          const skillTitle = skillName
+            .split("-")
+            .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+            .join(" ");
+          const skillContent = [
+            "---",
+            `name: ${skillName}`,
+            `description: "Extracted from learning ${learningId}. Replace with a concise description."`,
+            "---",
+            "",
+            `# ${skillTitle}`,
+            "",
+            "## Why",
+            summary,
+            "",
+            "## When To Use",
+            "- [TODO] Define trigger conditions",
+            "",
+            "## Steps",
+            "1. [TODO] Add repeatable workflow steps",
+            "2. [TODO] Add verification steps",
+            "",
+            "## Source Learning",
+            `- Learning ID: ${learningId}`,
+            `- Source File: .learnings/${sourceFile}`,
+            "",
+          ].join("\n");
+          await writeFile(skillPath, skillContent, "utf-8");
+
+          const promotedMarker = `**Status**: promoted_to_skill`;
+          const skillPathMarker = `- Skill-Path: ${safeOutputDir || "skills"}/${skillName}`;
+          let updatedEntry = match[0];
+          updatedEntry = updatedEntry.includes("**Status**:")
+            ? updatedEntry.replace(/\*\*Status\*\*:\s*.+/m, promotedMarker)
+            : `${updatedEntry.trimEnd()}\n${promotedMarker}\n`;
+          if (!updatedEntry.includes("Skill-Path:")) {
+            updatedEntry = `${updatedEntry.trimEnd()}\n${skillPathMarker}\n`;
+          }
+          const updatedLearningBody = learningBody.replace(match[0], updatedEntry);
+          await writeFile(learningsPath, updatedLearningBody, "utf-8");
+
+          return {
+            content: [{ type: "text", text: `Extracted skill scaffold to ${safeOutputDir || "skills"}/${skillName}/SKILL.md and updated ${learningId}.` }],
+            details: {
+              action: "skill_extracted",
+              learningId,
+              sourceFile,
+              skillPath: `${safeOutputDir || "skills"}/${skillName}/SKILL.md`,
+            },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to extract skill: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_extract_skill_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_extract_skill" }
+  );
+}
+
+export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_review",
+      label: "Self-Improvement Review",
+      description: "Summarize governance backlog from .learnings files (pending/high-priority/promoted counts).",
+      parameters: Type.Object({}),
+      async execute() {
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureSelfImprovementLearningFiles(workspaceDir);
+          const learningsDir = join(workspaceDir, ".learnings");
+          const files = ["LEARNINGS.md", "ERRORS.md"] as const;
+          const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
+
+          for (const f of files) {
+            const content = await readFile(join(learningsDir, f), "utf-8").catch(() => "");
+            stats.total += (content.match(/^## \[/gm) || []).length;
+            stats.pending += (content.match(/\*\*Status\*\*:\s*pending/gi) || []).length;
+            stats.high += (content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []).length;
+            stats.promoted += (content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []).length;
+          }
+
+          const text = [
+            "Self-Improvement Governance Snapshot:",
+            `- Total entries: ${stats.total}`,
+            `- Pending: ${stats.pending}`,
+            `- High/Critical: ${stats.high}`,
+            `- Promoted: ${stats.promoted}`,
+            "",
+            "Recommended loop:",
+            "1) Resolve high-priority pending entries",
+            "2) Distill reusable rules into AGENTS.md / SOUL.md / TOOLS.md",
+            "3) Extract repeatable patterns as skills",
+          ].join("\n");
+
+          return {
+            content: [{ type: "text", text }],
+            details: { action: "review", stats },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to review self-improvement backlog: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_review_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_review" }
+  );
 }
 
 // ============================================================================
@@ -227,7 +487,8 @@ export function registerMemoryRecallTool(
               if (r.sources.bm25) sources.push("BM25");
               if (r.sources.reranked) sources.push("reranked");
 
-              return `${i + 1}. [${r.entry.id}] [${r.entry.category}:${r.entry.scope}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              const categoryTag = getDisplayCategoryTag(r.entry);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
             })
             .join("\n");
 
@@ -339,7 +600,17 @@ export function registerMemoryStoreTool(
           const vector = await runtimeContext.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          const existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [targetScope]);
+          // Fail-open by design: dedup must never block a legitimate memory write.
+          let existing: Awaited<ReturnType<MemoryStore["vectorSearch"]>> = [];
+          try {
+            existing = await runtimeContext.store.vectorSearch(vector, 1, 0.1, [
+              targetScope,
+            ]);
+          } catch (err) {
+            console.warn(
+              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+            );
+          }
 
           if (existing.length > 0 && existing[0].score > 0.98) {
             return {
@@ -380,6 +651,14 @@ export function registerMemoryStoreTool(
               ),
             ),
           });
+
+          // Dual-write to Markdown mirror if enabled
+          if (context.mdMirror) {
+            await context.mdMirror(
+              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+              { source: "memory_store", agentId },
+            );
+          }
 
           return {
             content: [
@@ -935,7 +1214,8 @@ export function registerMemoryListTool(
               const date = new Date(entry.timestamp)
                 .toISOString()
                 .split("T")[0];
-              return `${safeOffset + i + 1}. [${entry.id}] [${entry.category}:${entry.scope}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
+              const categoryTag = getDisplayCategoryTag(entry);
+              return `${safeOffset + i + 1}. [${entry.id}] [${categoryTag}] ${entry.text.slice(0, 100)}${entry.text.length > 100 ? "..." : ""} (${date})`;
             })
             .join("\n");
 
@@ -951,7 +1231,8 @@ export function registerMemoryListTool(
               memories: entries.map((e) => ({
                 id: e.id,
                 text: e.text,
-                category: e.category,
+                category: getDisplayCategoryTag(e),
+                rawCategory: e.category,
                 scope: e.scope,
                 importance: e.importance,
                 timestamp: e.timestamp,
@@ -991,6 +1272,7 @@ export function registerAllMemoryTools(
   context: ToolContext,
   options: {
     enableManagementTools?: boolean;
+    enableSelfImprovementTools?: boolean;
   } = {},
 ) {
   // Core tools (always enabled)
@@ -1003,5 +1285,12 @@ export function registerAllMemoryTools(
   if (options.enableManagementTools) {
     registerMemoryStatsTool(api, context);
     registerMemoryListTool(api, context);
+  }
+  if (options.enableSelfImprovementTools !== false) {
+    registerSelfImprovementLogTool(api, context);
+    if (options.enableManagementTools) {
+      registerSelfImprovementExtractSkillTool(api, context);
+      registerSelfImprovementReviewTool(api, context);
+    }
   }
 }

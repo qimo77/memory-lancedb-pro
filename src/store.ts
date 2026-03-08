@@ -23,7 +23,7 @@ export interface MemoryEntry {
   id: string;
   text: string;
   vector: number[];
-  category: "preference" | "fact" | "decision" | "entity" | "other";
+  category: "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
   scope: string;
   importance: number;
   timestamp: number;

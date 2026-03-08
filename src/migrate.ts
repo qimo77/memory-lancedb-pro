@@ -7,7 +7,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs/promises";
 import type { MemoryStore, MemoryEntry } from "./store.js";
-import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 import { loadLanceDB } from "./store.js";
 
 // ============================================================================
@@ -37,6 +36,22 @@ interface MigrationOptions {
   dryRun?: boolean;
   defaultScope?: string;
   skipExisting?: boolean;
+}
+
+function normalizeLegacyVector(value: unknown): number[] {
+  if (Array.isArray(value)) {
+    return value.map((n) => Number(n));
+  }
+
+  if (
+    value &&
+    typeof value === "object" &&
+    Symbol.iterator in (value as Record<PropertyKey, unknown>)
+  ) {
+    return Array.from(value as Iterable<unknown>, (n) => Number(n));
+  }
+
+  return [];
 }
 
 // ============================================================================
@@ -153,7 +168,7 @@ export class MemoryMigrator {
       return entries.map((row): LegacyMemoryEntry => ({
         id: row.id as string,
         text: row.text as string,
-        vector: row.vector as number[],
+        vector: normalizeLegacyVector(row.vector),
         importance: Number(row.importance),
         category: (row.category as LegacyMemoryEntry["category"]) || "other",
         createdAt: Number(row.createdAt),
@@ -179,6 +194,11 @@ export class MemoryMigrator {
       try {
         // Check if entry already exists (if skipExisting is enabled)
         if (options.skipExisting) {
+          if (legacy.id && (await this.targetStore.hasId(legacy.id))) {
+            skipped++;
+            continue;
+          }
+
           const existing = await this.targetStore.vectorSearch(
             legacy.vector, 1, 0.9, [legacy.scope || defaultScope]
           );
@@ -188,34 +208,23 @@ export class MemoryMigrator {
           }
         }
 
-        // Convert legacy entry to new format
-        const newEntry: Omit<MemoryEntry, "id" | "timestamp"> = {
+        // Convert legacy entry to new format while preserving legacy identity.
+        const newEntry: MemoryEntry = {
+          id: legacy.id,
           text: legacy.text,
           vector: legacy.vector,
           category: legacy.category,
-          scope: legacy.scope || defaultScope, // Use legacy scope or default
+          scope: legacy.scope || defaultScope,
           importance: legacy.importance,
-          metadata: stringifySmartMetadata(
-            buildSmartMetadata(
-              {
-                text: legacy.text,
-                category: legacy.category,
-                importance: legacy.importance,
-                timestamp: legacy.createdAt,
-              },
-              {
-                l0_abstract: legacy.text,
-                l1_overview: `- ${legacy.text}`,
-                l2_content: legacy.text,
-                migratedFrom: "memory-lancedb",
-                originalId: legacy.id,
-                originalCreatedAt: legacy.createdAt,
-              },
-            ),
-          ),
+          timestamp: Number.isFinite(legacy.createdAt) ? legacy.createdAt : Date.now(),
+          metadata: JSON.stringify({
+            migratedFrom: "memory-lancedb",
+            originalId: legacy.id,
+            originalCreatedAt: legacy.createdAt,
+          }),
         };
 
-        await this.targetStore.store(newEntry);
+        await this.targetStore.importEntry(newEntry);
         migrated++;
 
         if (migrated % 100 === 0) {
@@ -231,7 +240,6 @@ export class MemoryMigrator {
     return { migrated, skipped, errors };
   }
 
-  // Check if migration is needed
   async checkMigrationNeeded(sourceDbPath?: string): Promise<{
     needed: boolean;
     sourceFound: boolean;
@@ -253,7 +261,7 @@ export class MemoryMigrator {
         needed: entries.length > 0,
         sourceFound: true,
         sourceDbPath: sourcePath,
-        entryCount: entries.length > 0 ? undefined : 0, // Avoid full scan; count unknown
+        entryCount: entries.length > 0 ? undefined : 0,
       };
     } catch (error) {
       return {
@@ -264,7 +272,6 @@ export class MemoryMigrator {
     }
   }
 
-  // Verify migration results
   async verifyMigration(sourceDbPath?: string): Promise<{
     valid: boolean;
     sourceCount: number;
@@ -290,7 +297,6 @@ export class MemoryMigrator {
       const sourceCount = sourceEntries.length;
       const targetCount = targetStats.totalCount;
 
-      // Basic validation - target should have at least as many entries as source
       if (targetCount < sourceCount) {
         issues.push(`Target has fewer entries (${targetCount}) than source (${sourceCount})`);
       }
@@ -313,17 +319,9 @@ export class MemoryMigrator {
   }
 }
 
-// ============================================================================
-// Factory Function
-// ============================================================================
-
 export function createMigrator(targetStore: MemoryStore): MemoryMigrator {
   return new MemoryMigrator(targetStore);
 }
-
-// ============================================================================
-// Standalone Migration Function
-// ============================================================================
 
 export async function migrateFromLegacy(
   targetStore: MemoryStore,
@@ -332,10 +330,6 @@ export async function migrateFromLegacy(
   const migrator = createMigrator(targetStore);
   return migrator.migrate(options);
 }
-
-// ============================================================================
-// CLI Helper Functions
-// ============================================================================
 
 export async function checkForLegacyData(): Promise<{
   found: boolean;
@@ -357,7 +351,6 @@ export async function checkForLegacyData(): Promise<{
         totalEntries += entries.length;
       }
     } catch {
-      // Path doesn't exist or isn't a valid LanceDB
       continue;
     }
   }
