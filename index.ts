@@ -1977,6 +1977,21 @@ const memoryLanceDBProPlugin = {
       { commands: ["memory-pro"] },
     );
 
+// Extract query string from event.prompt (can be string or object with query field)
+function extractQueryString(prompt: unknown): string {
+  if (typeof prompt === "string") {
+    return prompt;
+  }
+  if (prompt && typeof prompt === "object" && "query" in prompt) {
+    const q = (prompt as Record<string, unknown>).query;
+    if (typeof q === "string") {
+      return q;
+    }
+  }
+  // Fallback: convert to string
+  return String(prompt);
+}
+
     // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
@@ -1985,9 +2000,11 @@ const memoryLanceDBProPlugin = {
     // Default is OFF to prevent the model from accidentally echoing injected context.
     if (config.autoRecall === true) {
       api.on("before_agent_start", async (event, ctx) => {
+        // Extract query string from prompt (handles both string and object formats)
+        const queryString = extractQueryString(event.prompt);
         if (
-          !event.prompt ||
-          shouldSkipRetrieval(event.prompt, config.autoRecallMinLength)
+          !queryString ||
+          shouldSkipRetrieval(queryString, config.autoRecallMinLength)
         ) {
           return;
         }
@@ -2003,7 +2020,7 @@ const memoryLanceDBProPlugin = {
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
           const results = await retrieveWithRetry({
-            query: event.prompt,
+            query: queryString,
             limit: 3,
             scopeFilter: accessibleScopes,
             source: "auto-recall",

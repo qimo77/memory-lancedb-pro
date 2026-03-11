@@ -480,8 +480,21 @@ export class MemoryStore {
 
     const safeLimit = clampInt(limit, 1, 20);
 
+    // Defensive: ensure query is a string (handle object passed by mistake)
+    let queryStr: string;
+    if (typeof query === "string") {
+      queryStr = query;
+    } else if (query && typeof query === "object" && "query" in query) {
+      // Handle case where query is { query: "actual query string", ... }
+      const q = (query as Record<string, unknown>).query;
+      queryStr = typeof q === "string" ? q : String(query);
+    } else {
+      // Fallback: convert to string
+      queryStr = String(query);
+    }
+
     // Clean the query string - remove special characters that cause LanceDB FTS to fail
-    const cleanedQuery = query
+    const cleanedQuery = queryStr
       .replace(/```[\s\S]*?```/g, '') // Remove code blocks
       .replace(/`/g, '') // Remove backticks
       .replace(/\[.*?\]\(.*?\)/g, '') // Remove markdown links

@@ -303,20 +303,31 @@ export class MemoryRetriever {
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category, source } = context;
+    // Defensive: ensure query is a string (handle object passed by mistake)
+    let safeQuery: string;
+    if (typeof context.query === "string") {
+      safeQuery = context.query;
+    } else if (context.query && typeof context.query === "object" && "query" in context.query) {
+      const q = (context.query as Record<string, unknown>).query;
+      safeQuery = typeof q === "string" ? q : String(context.query);
+    } else {
+      safeQuery = String(context.query);
+    }
+
+    const { limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
 
     let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
       results = await this.vectorOnlyRetrieval(
-        query,
+        safeQuery,
         safeLimit,
         scopeFilter,
         category,
       );
     } else {
       results = await this.hybridRetrieval(
-        query,
+        safeQuery,
         safeLimit,
         scopeFilter,
         category,
