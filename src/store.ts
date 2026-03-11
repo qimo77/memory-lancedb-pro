@@ -480,13 +480,26 @@ export class MemoryStore {
 
     const safeLimit = clampInt(limit, 1, 20);
 
+    // Clean the query string - remove special characters that cause LanceDB FTS to fail
+    const cleanedQuery = query
+      .replace(/```[\s\S]*?```/g, '') // Remove code blocks
+      .replace(/`/g, '') // Remove backticks
+      .replace(/\[.*?\]\(.*?\)/g, '') // Remove markdown links
+      .replace(/\n+/g, ' ') // Replace newlines with spaces
+      .replace(/\s+/g, ' ') // Collapse multiple spaces
+      .trim();
+
+    if (!cleanedQuery) {
+      return [];
+    }
+
     if (!this.ftsIndexCreated) {
-      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+      return this.lexicalFallbackSearch(cleanedQuery, safeLimit, scopeFilter);
     }
 
     try {
       // Use FTS query type explicitly
-      let searchQuery = this.table!.search(query, "fts").limit(safeLimit);
+      let searchQuery = this.table!.search(cleanedQuery, "fts").limit(safeLimit);
 
       // Apply scope filter if provided
       if (scopeFilter && scopeFilter.length > 0) {
