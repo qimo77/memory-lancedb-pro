@@ -511,8 +511,8 @@ export class MemoryStore {
     }
 
     try {
-      // Use FTS query type explicitly
-      let searchQuery = this.table!.search(cleanedQuery, "fts").limit(safeLimit);
+      // Use FTS query type explicitly - pass empty string array for ftsColumns to avoid object construction
+      let searchQuery = this.table!.search(cleanedQuery, "fts", []).limit(safeLimit);
 
       // Apply scope filter if provided
       if (scopeFilter && scopeFilter.length > 0) {
